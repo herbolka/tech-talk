@@ -1,495 +1,173 @@
-name: Deploy with Gemini AI Review
+name: AI Agent Deploy Pipeline
 
 on:
   push:
-    branches:
-      - main
-      - develop
-    paths:
-      - 'src/**'
-      - 'pom.xml'
-      - 'Dockerfile'
-      - 'k8s/**'
-      - '.github/workflows/**'
-  pull_request:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: [tech-talk-feature-ai-agent-deploy]
 
-env:
+env:ІІ
   AWS_REGION: us-east-1
+  EKS_CLUSTER: currency-cluster
   ECR_REPOSITORY: currency-conversion-service
-  EKS_CLUSTER_NAME: currency-cluster
-  EKS_NAMESPACE: production
-  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
 
 jobs:
-  # Job 1: Gemini AI Code Review
-  code-review:
-    name: Gemini AI Code Review
+
+  gemini-code-review:
+    name: Gemini code review
     runs-on: ubuntu-latest
-    outputs:
-      review-result: ${{ steps.gemini-review.outputs.result }}
-      security-issues: ${{ steps.gemini-review.outputs.security-issues }}
-      performance-concerns: ${{ steps.gemini-review.outputs.performance-concerns }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch full history for diffs
+          fetch-depth: 0
 
-      - name: Get changed files
-        id: changed-files
-        uses: tj-actions/changed-files@v41
+      - uses: actions/setup-node@v4
         with:
-          files: |
-            src/**
-            Dockerfile
-            pom.xml
-            k8s/**
+          node-version: "20"
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+      - name: Install Gemini CLI
+        run: npm install -g @google/gemini-cli
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-generativeai pyyaml
-
-      - name: Run Gemini AI Code Review
-        id: gemini-review
+      - name: Review changes
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GITHUB_CONTEXT: ${{ toJson(github) }}
         run: |
-          python scripts/gemini_code_review.py \
-            --changed-files "${{ steps.changed-files.outputs.all_changed_files }}" \
-            --api-key "${{ secrets.GEMINI_API_KEY }}" \
-            --workflow-run-id "${{ github.run_id }}"
+          git diff HEAD~1 HEAD > changes.diff
+          gemini -m gemini-2.5-flash-lite -p "
+            Review this git diff. Check Dockerfile, Terraform, and Kubernetes configs.
+            Look for security issues, missing resource limits, and misconfigurations.
+            Output: PASS or FAIL with a one-line reason.
+          " < changes.diff
 
-      - name: Comment PR with Review Results
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const reviewOutput = fs.readFileSync('review_output.md', 'utf8');
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: reviewOutput
-            });
-
-      - name: Fail if critical issues found
-        if: failure() || steps.gemini-review.outputs.result == 'FAILED'
-        run: |
-          echo "❌ Gemini AI review failed due to critical issues"
-          exit 1
-
-      - name: Report Review Status
-        run: |
-          echo "✅ Code Review Passed"
-          echo "Result: ${{ steps.gemini-review.outputs.result }}"
-
-  # Job 2: Build and Test
-  build:
-    name: Build and Test
+  terraform:
+    name: Provision infrastructure
     runs-on: ubuntu-latest
-    needs: code-review
+    needs: gemini-code-review
+    defaults:
+      run:
+        working-directory: terraform
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK
-        uses: actions/setup-java@v3
-        with:
-          java-version: '11'
-          distribution: 'temurin'
-          cache: maven
+      - uses: hashicorp/setup-terraform@v3
 
-      - name: Run Maven tests
-        run: mvn test
-
-      - name: Build with Maven
-        run: mvn clean package -DskipTests
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
-        with:
-          name: build-artifacts
-          path: target/
-
-  # Job 3: Build Docker Image
-  build-image:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    needs: build
-    outputs:
-      image-uri: ${{ steps.image-uri.outputs.uri }}
-      image-tag: ${{ steps.image-tag.outputs.tag }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v3
-        with:
-          name: build-artifacts
-          path: target/
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Generate image tag
-        id: image-tag
-        run: |
-          TAG="v${{ github.run_number }}-$(git rev-parse --short HEAD)"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "Image tag: $TAG"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: Terraform init
+        run: terraform init
+
+      - name: Terraform plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve tfplan
+
+  build-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    needs: terraform
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image URI
-        id: image-uri
+      - name: Build and push
+        id: push
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
         run: |
-          IMAGE_URI="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.tag }}"
-          echo "uri=$IMAGE_URI" >> $GITHUB_OUTPUT
-          echo "Image URI: $IMAGE_URI"
+          docker build \
+            -t "$REGISTRY/$ECR_REPOSITORY:$TAG" \
+            -t "$REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image=$REGISTRY/$ECR_REPOSITORY:$TAG" >> $GITHUB_OUTPUT
 
-      - name: Build, tag, and push Docker image to ECR
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ steps.image-uri.outputs.uri }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
-          cache-from: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:buildcache
-          cache-to: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:buildcache,mode=max
-
-      - name: Image scan results
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          echo "Image pushed successfully!"
-          aws ecr describe-images \
-            --repository-name ${{ env.ECR_REPOSITORY }} \
-            --region ${{ env.AWS_REGION }} \
-            --query 'imageDetails[?imageTags[0]==`${{ steps.image-tag.outputs.tag }}`]'
-
-  # Job 4: Terraform Plan and Apply
-  infrastructure:
-    name: Terraform Infrastructure
-    runs-on: ubuntu-latest
-    needs: [build-image]
-    env:
-      TF_VERSION: 1.5.0
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
-
-      - name: Terraform Validate
-        working-directory: terraform
-        run: terraform validate
-
-      - name: Terraform Plan
-        working-directory: terraform
-        id: tf-plan
-        run: |
-          terraform plan -out=tfplan -json > tfplan.json
-          echo "plan_summary<<EOF" >> $GITHUB_OUTPUT
-          terraform show -no-color tfplan | head -50 >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Comment Plan on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## Terraform Plan\n\`\`\`\n${{ steps.tf-plan.outputs.plan_summary }}\n\`\`\``
-            });
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        working-directory: terraform
-        run: terraform apply -auto-approve tfplan
-
-      - name: Get Terraform Outputs
-        id: tf-outputs
-        working-directory: terraform
-        run: |
-          EKS_ENDPOINT=$(terraform output -raw eks_cluster_endpoint 2>/dev/null || echo "")
-          EKS_CLUSTER=$(terraform output -raw eks_cluster_name 2>/dev/null || echo "${{ env.EKS_CLUSTER_NAME }}")
-          echo "eks_endpoint=$EKS_ENDPOINT" >> $GITHUB_OUTPUT
-          echo "eks_cluster=$EKS_CLUSTER" >> $GITHUB_OUTPUT
-
-      - name: Upload Terraform state
-        uses: actions/upload-artifact@v3
-        with:
-          name: terraform-state
-          path: terraform/tfplan
-
-  # Job 5: Deploy to Kubernetes
-  deploy:
+  deploy-k8s:
     name: Deploy to Kubernetes
     runs-on: ubuntu-latest
-    needs: [build-image, infrastructure]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    needs: build-push
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --region ${{ env.AWS_REGION }} \
-            --name ${{ env.EKS_CLUSTER_NAME }}
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
 
-      - name: Create Namespace
-        run: |
-          kubectl create namespace ${{ env.EKS_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Create ECR Secret
-        env:
-          ECR_REGISTRY: ${{ needs.build-image.outputs.image-uri }}
+      - name: Create ECR pull secret
         run: |
           kubectl create secret docker-registry ecr-secret \
-            --docker-server=$(echo $ECR_REGISTRY | cut -d'/' -f1) \
+            --docker-server=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com \
             --docker-username=AWS \
-            --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
-            -n ${{ env.EKS_NAMESPACE }} \
+            --docker-password=$(aws ecr get-login-password --region $AWS_REGION) \
+            --namespace=production \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Update deployment image
-        env:
-          IMAGE_URI: ${{ needs.build-image.outputs.image-uri }}
-        run: |
-          sed -i "s|<your-docker-registry>/currency-conversion-service:latest|$IMAGE_URI|g" k8s/deployment.yml
-          cat k8s/deployment.yml
-
-      - name: Apply Kubernetes manifests
+      - name: Apply manifests
         run: |
           kubectl apply -f k8s/namespace.yml
-          kubectl apply -f k8s/configmap.yml
-          kubectl apply -f k8s/deployment.yml
-          kubectl apply -f k8s/service.yml
-          kubectl apply -f k8s/hpa.yml
+          kubectl apply -f k8s/configmap.yml  -n production
+          kubectl apply -f k8s/service.yml    -n production
+          kubectl apply -f k8s/deployment.yml -n production
+          kubectl apply -f k8s/hpa.yml        -n production
+          kubectl apply -f k8s/pdb.yml        -n production
+
+      - name: Update image
+        run: |
+          kubectl set image deployment/currency-conversion-service \
+            currency-conversion=${{ needs.build-push.outputs.image }} \
+            -n production
 
       - name: Wait for rollout
         run: |
           kubectl rollout status deployment/currency-conversion-service \
-            -n ${{ env.EKS_NAMESPACE }} \
-            --timeout=5m
+            -n production --timeout=5m
 
-      - name: Get deployment info
-        id: deploy-info
-        run: |
-          kubectl get pods -n ${{ env.EKS_NAMESPACE }}
-          kubectl get svc -n ${{ env.EKS_NAMESPACE }}
-          
-          # Get LoadBalancer IP
-          LB_IP=$(kubectl get svc currency-conversion-service -n ${{ env.EKS_NAMESPACE }} \
-            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
-          echo "loadbalancer_ip=$LB_IP" >> $GITHUB_OUTPUT
-
-      - name: Save deployment info
-        run: |
-          cat > deployment-info.txt << EOF
-          Namespace: ${{ env.EKS_NAMESPACE }}
-          Deployment: currency-conversion-service
-          Image: ${{ needs.build-image.outputs.image-uri }}
-          Timestamp: $(date -u)
-          EOF
-          cat deployment-info.txt
-
-      - name: Upload deployment info
-        uses: actions/upload-artifact@v3
-        with:
-          name: deployment-info
-          path: deployment-info.txt
-
-  # Job 6: Validate Deployment with Gemini AI
-  validate:
-    name: Validate Deployment
+  gemini-validate:
+    name: Gemini validation
     runs-on: ubuntu-latest
-    needs: [deploy, build-image]
-    if: success()
+    needs: deploy-k8s
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - name: Install Gemini CLI
+        run: npm install -g @google/gemini-cli
+
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update kubeconfig
-        run: |
-          aws eks update-kubeconfig \
-            --region ${{ env.AWS_REGION }} \
-            --name ${{ env.EKS_CLUSTER_NAME }}
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
 
-      - name: Run health checks
-        id: health-checks
-        run: |
-          echo "Checking deployment health..."
-          
-          # Check pod status
-          RUNNING_PODS=$(kubectl get pods -n ${{ env.EKS_NAMESPACE }} \
-            -l app=currency-conversion \
-            -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | wc -w)
-          echo "Running pods: $RUNNING_PODS"
-          
-          # Check if at least 2 pods are running
-          if [ $RUNNING_PODS -lt 2 ]; then
-            echo "❌ Not enough pods running!"
-            exit 1
-          fi
-          
-          echo "pod_count=$RUNNING_PODS" >> $GITHUB_OUTPUT
-
-      - name: Check service endpoints
-        run: |
-          echo "Checking service status..."
-          kubectl get svc currency-conversion-service -n ${{ env.EKS_NAMESPACE }} -o wide
-          
-          # Wait a bit more for LoadBalancer to be ready
-          sleep 30
-          
-          SERVICE_IP=$(kubectl get svc currency-conversion-service -n ${{ env.EKS_NAMESPACE }} \
-            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
-          
-          if [ -z "$SERVICE_IP" ]; then
-            echo "⚠️  LoadBalancer IP pending (this is normal for AWS ELB)"
-          else
-            echo "✅ LoadBalancer IP: $SERVICE_IP"
-          fi
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install google-generativeai pyyaml
-
-      - name: Run Gemini AI Deployment Validation
+      - name: Validate deployment
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python scripts/gemini_deployment_validation.py \
-            --api-key "${{ secrets.GEMINI_API_KEY }}" \
-            --namespace "${{ env.EKS_NAMESPACE }}" \
-            --deployment "currency-conversion-service" \
-            --image-uri "${{ needs.build-image.outputs.image-uri }}"
-
-      - name: Generate deployment report
-        run: |
-          cat > deployment-report.md << EOF
-          # Deployment Report
-          
-          **Date**: $(date -u)
-          **Deployment**: currency-conversion-service
-          **Namespace**: ${{ env.EKS_NAMESPACE }}
-          **Image**: ${{ needs.build-image.outputs.image-uri }}
-          **Running Pods**: ${{ steps.health-checks.outputs.pod_count }}
-          
-          ## Status
-          ✅ Deployment successful
-          ✅ All health checks passed
-          ✅ Gemini AI validation completed
-          
-          ## Next Steps
-          - Monitor application logs
-          - Check HPA status
-          - Validate with real traffic
-          EOF
-          cat deployment-report.md
-
-      - name: Upload deployment report
-        uses: actions/upload-artifact@v3
-        with:
-          name: deployment-report
-          path: deployment-report.md
-
-      - name: Send Slack Notification (Optional)
-        if: always()
-        uses: slackapi/slack-github-action@v1.24.0
-        with:
-          payload: |
-            {
-              "text": "✅ Deployment Completed Successfully",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "✅ *Deployment Report*\n*Service*: currency-conversion-service\n*Image*: ${{ needs.build-image.outputs.image-uri }}\n*Status*: Successful"
-                  }
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
-
-  # Job 7: Cleanup on failure
-  notify-failure:
-    name: Notify on Failure
-    runs-on: ubuntu-latest
-    if: failure()
-    needs: [code-review, build, build-image, infrastructure, deploy, validate]
-    steps:
-      - name: Send failure notification
-        run: |
-          echo "❌ Deployment pipeline failed!"
-          echo "Run ID: ${{ github.run_id }}"
-          echo "Check logs at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          kubectl get pods,svc,hpa -n production -o json | \
+          gemini -m gemini-2.5-flash-lite -p "
+            Is this Kubernetes deployment healthy?
+            Output: HEALTHY or UNHEALTHY with pod count and external IP.
+          "

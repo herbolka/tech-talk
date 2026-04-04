@@ -1,0 +1,12 @@
+aws_region          = "us-east-1"
+environment         = "production"
+cluster_name        = "currency-cluster"
+kubernetes_version  = "1.28"
+vpc_cidr            = "10.0.0.0/16"
+subnet_count        = 2
+instance_type       = "t3.small"
+capacity_type       = "SPOT"
+desired_capacity    = 1
+min_size            = 1
+max_size            = 3
+ecr_repository_name = "currency-conversion-service"
