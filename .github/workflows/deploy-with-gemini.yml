@@ -4,7 +4,7 @@ on:
   push:
     branches: [tech-talk-feature-ai-agent-deploy]
 
-env:ІІ
+env:
   AWS_REGION: us-east-1
   EKS_CLUSTER: currency-cluster
   ECR_REPOSITORY: currency-conversion-service
