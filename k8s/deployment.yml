@@ -39,7 +39,7 @@ spec:
       
       containers:
       - name: currency-conversion
-        image: 583883919092.dkr.ecr.us-east-1.amazonaws.com/currency-conversion-service:latest
+        image: (TBA)us-east-1.amazonaws.com/currency-conversion-service:latest
         imagePullPolicy: Always
         
         # Container ports
